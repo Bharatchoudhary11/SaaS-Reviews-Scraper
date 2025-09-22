@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 import os
 import re
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Set
 from urllib.parse import quote_plus
 
 import requests
@@ -320,15 +321,65 @@ def build_g2_urls(company_slug: str, max_pages: int = 20) -> List[str]:
         return [f"https://www.g2.com/products/{company_slug}/reviews?page={i}" for i in range(1, max_pages + 1)]
 
 
+def _collect_slugs_from_json(node: object, results: Set[str]) -> None:
+        if isinstance(node, dict):
+                slug_candidate = node.get("slug")
+                if isinstance(slug_candidate, str):
+                        slug_candidate = slug_candidate.strip()
+                        if slug_candidate:
+                                results.add(slug_candidate)
+
+                path_candidate = node.get("path") or node.get("url") or node.get("href")
+                if isinstance(path_candidate, str):
+                        match = re.search(r"/products/([^/]+)/reviews", path_candidate)
+                        if match:
+                                results.add(match.group(1).strip())
+
+                for value in node.values():
+                        _collect_slugs_from_json(value, results)
+        elif isinstance(node, list):
+                for item in node:
+                        _collect_slugs_from_json(item, results)
+        elif isinstance(node, str):
+                match = re.search(r"/products/([^/]+)/reviews", node)
+                if match:
+                        results.add(match.group(1).strip())
+
+
+def _score_slug_candidate(candidate: str, normalized_query: str) -> float:
+        if not candidate:
+                return -math.inf
+
+        candidate_norm = normalize_company_to_slug(candidate)
+        score = 0.0
+
+        if candidate_norm == normalized_query:
+                score += 3.0
+        elif normalized_query in candidate_norm:
+                score += 2.0
+
+        # Simple similarity heuristic to prioritize close matches.
+        overlap = len(set(candidate_norm.split("-")) & set(normalized_query.split("-")))
+        score += overlap * 0.5
+
+        # Slight preference for shorter slugs when everything else ties.
+        score -= len(candidate_norm) * 0.01
+        return score
+
+
 def find_g2_slug(company: str, session: requests.Session) -> Optional[str]:
         query = company.strip()
         if not query:
                 return None
 
+        normalized_query = normalize_company_to_slug(query)
         search_templates = (
                 "https://www.g2.com/search?query={query}",
                 "https://www.g2.com/search/products?query={query}",
         )
+
+        best_slug: Optional[str] = None
+        best_score = -math.inf
 
         for template in search_templates:
                 search_url = template.format(query=quote_plus(query))
@@ -338,12 +389,14 @@ def find_g2_slug(company: str, session: requests.Session) -> Optional[str]:
 
                 soup = BeautifulSoup(html, "html.parser")
 
+                candidates: Set[str] = set()
+
                 # G2 embeds useful metadata about products in data attributes.
                 for attr in ("data-product-slug", "data-track-product-slug", "data-slug"):
                         for node in soup.select(f"[{attr}]"):
                                 slug = _normalize_value(node.get(attr))
                                 if slug:
-                                        return slug
+                                        candidates.add(slug)
 
                 for link in soup.select("a[href]"):
                         href = link.get("href") or ""
@@ -351,9 +404,25 @@ def find_g2_slug(company: str, session: requests.Session) -> Optional[str]:
                         if match:
                                 slug = match.group(1).strip()
                                 if slug:
-                                        return slug
+                                        candidates.add(slug)
 
-        return None
+                script_node = soup.find("script", {"id": "__NEXT_DATA__"})
+                if script_node and script_node.string:
+                        try:
+                                data = json.loads(script_node.string)
+                        except json.JSONDecodeError:
+                                data = None
+
+                        if data is not None:
+                                _collect_slugs_from_json(data, candidates)
+
+                for candidate in candidates:
+                        score = _score_slug_candidate(candidate, normalized_query)
+                        if score > best_score:
+                                best_slug = candidate
+                                best_score = score
+
+        return best_slug
 
 
 def build_capterra_urls(company_slug: str, max_pages: int = 20) -> List[str]:
