@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, Iterable, List, Optional
+from urllib.parse import quote_plus
 
 import requests
 from bs4 import BeautifulSoup
@@ -319,6 +320,42 @@ def build_g2_urls(company_slug: str, max_pages: int = 20) -> List[str]:
         return [f"https://www.g2.com/products/{company_slug}/reviews?page={i}" for i in range(1, max_pages + 1)]
 
 
+def find_g2_slug(company: str, session: requests.Session) -> Optional[str]:
+        query = company.strip()
+        if not query:
+                return None
+
+        search_templates = (
+                "https://www.g2.com/search?query={query}",
+                "https://www.g2.com/search/products?query={query}",
+        )
+
+        for template in search_templates:
+                search_url = template.format(query=quote_plus(query))
+                html = fetch_html(search_url, session=session)
+                if not html:
+                        continue
+
+                soup = BeautifulSoup(html, "html.parser")
+
+                # G2 embeds useful metadata about products in data attributes.
+                for attr in ("data-product-slug", "data-track-product-slug", "data-slug"):
+                        for node in soup.select(f"[{attr}]"):
+                                slug = _normalize_value(node.get(attr))
+                                if slug:
+                                        return slug
+
+                for link in soup.select("a[href]"):
+                        href = link.get("href") or ""
+                        match = re.search(r"/products/([^/]+)/reviews", href)
+                        if match:
+                                slug = match.group(1).strip()
+                                if slug:
+                                        return slug
+
+        return None
+
+
 def build_capterra_urls(company_slug: str, max_pages: int = 20) -> List[str]:
         # Capterra URLs vary. A generic fallback that sometimes works:
         # https://www.capterra.com/reviews/{slug}?page=1
@@ -337,6 +374,7 @@ def build_trustradius_urls(company_slug: str, max_pages: int = 20) -> List[str]:
 
 UrlBuilder = Callable[[str, int], List[str]]
 SourceExtractor = Callable[[str], List[Dict]]
+SlugFinder = Callable[[str, requests.Session], Optional[str]]
 
 
 @dataclass(frozen=True)
@@ -344,10 +382,16 @@ class SourceConfig:
         name: str
         url_builder: UrlBuilder
         extractor: SourceExtractor
+        slug_finder: Optional[SlugFinder] = None
 
 
 SOURCE_REGISTRY: Dict[str, SourceConfig] = {
-        "g2": SourceConfig(name="G2", url_builder=build_g2_urls, extractor=extract_reviews_g2),
+        "g2": SourceConfig(
+                name="G2",
+                url_builder=build_g2_urls,
+                extractor=extract_reviews_g2,
+                slug_finder=find_g2_slug,
+        ),
         "capterra": SourceConfig(
                 name="Capterra", url_builder=build_capterra_urls, extractor=extract_reviews_capterra
         ),
@@ -373,65 +417,96 @@ def scrape_reviews(
                 valid_names = ", ".join(sorted(cfg.name for cfg in SOURCE_REGISTRY.values()))
                 raise ValueError(f"source must be one of: {valid_names} (case-insensitive).")
 
-        urls = config.url_builder(company_slug, max_pages=max_pages)
-        extractor = config.extractor
+        attempted_slugs: List[str] = []
+        slug_queue: List[str] = [company_slug]
+        seen_slugs = {company_slug}
 
-        all_reviews: List[Dict] = []
-        pages_fetched = 0
-        raw_reviews_extracted = 0
+        def attempt_scrape_for_slug(candidate_slug: str) -> Optional[List[Dict]]:
+                urls = config.url_builder(candidate_slug, max_pages=max_pages)
+                extractor = config.extractor
 
-        for url in tqdm(urls, desc=f"Scraping {config.name} pages", unit="page"):
-                html = fetch_html(url, session=session)
-                if not html:
-                        continue
-                pages_fetched += 1
-                page_reviews = extractor(html)
-                raw_reviews_extracted += len(page_reviews)
-                if not page_reviews:
-                        # Heuristic: continue; sites may still have reviews on later pages
-                        continue
-                all_reviews.extend(page_reviews)
-                # Optional: be respectful
-                time.sleep(0.75)
+                all_reviews: List[Dict] = []
+                pages_fetched = 0
+                raw_reviews_extracted = 0
 
-        if pages_fetched == 0:
-                raise RuntimeError(
-                        "Unable to load any review pages. Verify the company slug exists on the selected "
-                        f"source (normalized to '{company_slug}') or try again later."
-                )
+                for url in tqdm(urls, desc=f"Scraping {config.name} pages", unit="page"):
+                        html = fetch_html(url, session=session)
+                        if not html:
+                                continue
+                        pages_fetched += 1
+                        page_reviews = extractor(html)
+                        raw_reviews_extracted += len(page_reviews)
+                        if not page_reviews:
+                                # Heuristic: continue; sites may still have reviews on later pages
+                                continue
+                        all_reviews.extend(page_reviews)
+                        # Optional: be respectful
+                        time.sleep(0.75)
 
-        # Deduplicate by (title, review, date)
-        unique: Dict[str, Dict] = {}
-        for r in all_reviews:
-                key = json.dumps([(r.get("title") or "").strip(), (r.get("review") or "").strip(), (r.get("date") or "").strip()])
-                if key not in unique:
-                        unique[key] = r
+                if pages_fetched == 0:
+                        return None
 
-        # Normalize and filter by date range
-        filtered: List[Dict] = []
-        for r in unique.values():
-                dt = parse_iso_date(r.get("date") or "")
-                if not in_range(dt, start, end):
-                        continue
-                # Set a stable ISO format for date if we could parse it
-                if dt:
-                        r["date"] = dt.strftime("%Y-%m-%d")
-                filtered.append(r)
+                # Deduplicate by (title, review, date)
+                unique: Dict[str, Dict] = {}
+                for r in all_reviews:
+                        key = json.dumps(
+                                [
+                                        (r.get("title") or "").strip(),
+                                        (r.get("review") or "").strip(),
+                                        (r.get("date") or "").strip(),
+                                ]
+                        )
+                        if key not in unique:
+                                unique[key] = r
 
-        if raw_reviews_extracted == 0:
-                print(
-                        f"Warning: {config.name} pages were fetched but no reviews could be parsed. "
-                        "The site layout may have changed.",
-                        file=sys.stderr,
-                )
-        elif not filtered and (start or end):
-                print(
-                        f"Note: {raw_reviews_extracted} reviews were extracted from {config.name}, "
-                        "but none matched the requested date range.",
-                        file=sys.stderr,
-                )
+                # Normalize and filter by date range
+                filtered: List[Dict] = []
+                for r in unique.values():
+                        dt = parse_iso_date(r.get("date") or "")
+                        if not in_range(dt, start, end):
+                                continue
+                        # Set a stable ISO format for date if we could parse it
+                        if dt:
+                                r["date"] = dt.strftime("%Y-%m-%d")
+                        filtered.append(r)
 
-        return filtered
+                if raw_reviews_extracted == 0:
+                        print(
+                                f"Warning: {config.name} pages were fetched but no reviews could be parsed. "
+                                "The site layout may have changed.",
+                                file=sys.stderr,
+                        )
+                elif not filtered and (start or end):
+                        print(
+                                f"Note: {raw_reviews_extracted} reviews were extracted from {config.name}, "
+                                "but none matched the requested date range.",
+                                file=sys.stderr,
+                        )
+
+                return filtered
+
+        while slug_queue:
+                slug = slug_queue.pop(0)
+                attempted_slugs.append(slug)
+                result = attempt_scrape_for_slug(slug)
+                if result is not None:
+                        return result
+
+                if slug == company_slug and config.slug_finder:
+                        try:
+                                alternate_slug = config.slug_finder(company, session=session)
+                        except Exception:
+                                alternate_slug = None
+                        if alternate_slug and alternate_slug not in seen_slugs:
+                                slug_queue.append(alternate_slug)
+                                seen_slugs.add(alternate_slug)
+
+        attempted_display = ", ".join(attempted_slugs)
+        raise RuntimeError(
+                "Unable to load any review pages. "
+                "Verify the company slug exists on the selected source or try again later. "
+                f"Attempted slug(s): {attempted_display or company_slug}."
+        )
 
 
 def main():
