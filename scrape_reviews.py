@@ -478,6 +478,10 @@ def scrape_reviews(
         max_pages: int = 20,
 ) -> List[Dict]:
         session = requests.Session()
+        allow_proxy_env = os.environ.get("SCRAPER_ALLOW_PROXY", "")
+        if allow_proxy_env.strip().lower() not in {"1", "true", "yes", "on"}:
+                session.trust_env = False
+                session.proxies = {}
         company_slug = normalize_company_to_slug(company)
 
         source_key = source.lower()
