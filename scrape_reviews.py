@@ -357,7 +357,13 @@ SOURCE_REGISTRY: Dict[str, SourceConfig] = {
 }
 
 
-def scrape_reviews(company: str, source: str, start: Optional[datetime], end: Optional[datetime], max_pages: int = 20) -> List[Dict]:
+def scrape_reviews(
+        company: str,
+        source: str,
+        start: Optional[datetime],
+        end: Optional[datetime],
+        max_pages: int = 20,
+) -> List[Dict]:
         session = requests.Session()
         company_slug = normalize_company_to_slug(company)
 
@@ -371,18 +377,28 @@ def scrape_reviews(company: str, source: str, start: Optional[datetime], end: Op
         extractor = config.extractor
 
         all_reviews: List[Dict] = []
+        pages_fetched = 0
+        raw_reviews_extracted = 0
 
         for url in tqdm(urls, desc=f"Scraping {config.name} pages", unit="page"):
                 html = fetch_html(url, session=session)
                 if not html:
                         continue
+                pages_fetched += 1
                 page_reviews = extractor(html)
+                raw_reviews_extracted += len(page_reviews)
                 if not page_reviews:
                         # Heuristic: continue; sites may still have reviews on later pages
                         continue
                 all_reviews.extend(page_reviews)
                 # Optional: be respectful
                 time.sleep(0.75)
+
+        if pages_fetched == 0:
+                raise RuntimeError(
+                        "Unable to load any review pages. Verify the company slug exists on the selected "
+                        f"source (normalized to '{company_slug}') or try again later."
+                )
 
         # Deduplicate by (title, review, date)
         unique: Dict[str, Dict] = {}
@@ -401,6 +417,19 @@ def scrape_reviews(company: str, source: str, start: Optional[datetime], end: Op
                 if dt:
                         r["date"] = dt.strftime("%Y-%m-%d")
                 filtered.append(r)
+
+        if raw_reviews_extracted == 0:
+                print(
+                        f"Warning: {config.name} pages were fetched but no reviews could be parsed. "
+                        "The site layout may have changed.",
+                        file=sys.stderr,
+                )
+        elif not filtered and (start or end):
+                print(
+                        f"Note: {raw_reviews_extracted} reviews were extracted from {config.name}, "
+                        "but none matched the requested date range.",
+                        file=sys.stderr,
+                )
 
         return filtered
 
