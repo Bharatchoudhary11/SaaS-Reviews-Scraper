@@ -27,6 +27,18 @@ DEFAULT_HEADERS = {
 }
 
 
+def _is_truthy(value: Optional[str]) -> bool:
+        if value is None:
+                return False
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_falsy(value: Optional[str]) -> bool:
+        if value is None:
+                return False
+        return value.strip().lower() in {"0", "false", "no", "off"}
+
+
 def parse_iso_date(value: str) -> Optional[datetime]:
         if not value:
                 return None
@@ -478,10 +490,14 @@ def scrape_reviews(
         max_pages: int = 20,
 ) -> List[Dict]:
         session = requests.Session()
-        allow_proxy_env = os.environ.get("SCRAPER_ALLOW_PROXY", "")
-        if allow_proxy_env.strip().lower() not in {"1", "true", "yes", "on"}:
+        allow_proxy_env = os.environ.get("SCRAPER_ALLOW_PROXY")
+        disable_proxy_env = os.environ.get("SCRAPER_DISABLE_PROXY")
+
+        if _is_truthy(disable_proxy_env) or _is_falsy(allow_proxy_env):
                 session.trust_env = False
                 session.proxies = {}
+        else:
+                session.trust_env = True
         company_slug = normalize_company_to_slug(company)
 
         source_key = source.lower()
